@@ -37,12 +37,16 @@ defmodule Ecto.Pools.ConnectionCache do
     GenServer.call name, {:checkin, pool_ref, state, opts}
   end
 
+  # I do not know what this is or how it's supposed to work.
+  # I basically copied the poolboy pool implementation.
   def disconnect(pool_ref, err, state, opts) do
     { name, conn, worker_ref } = pool_ref
     DBConnection.Connection.disconnect(worker_ref, err, state, opts)
     checkin(pool_ref, state, opts)
   end
 
+  # I do not know what this is or how it's supposed to work.
+  # I basically copied the poolboy pool implementation.
   def stop(pool_ref, err, state, opts) do
     { name, conn, worker_ref } = pool_ref
     DBConnection.Connection.sync_stop(worker_ref, err, state, opts)
@@ -50,7 +54,8 @@ defmodule Ecto.Pools.ConnectionCache do
   end
 
   def init {name, conn_module, options} do
-    conn_options = Keyword.take(options, ~w(hostname port database username password extensions)a)
+    conn_options = options
+      |> Keyword.take(~w(hostname port database username password extensions)a)
       |> Keyword.put(:types, true)
       |> Enum.uniq
 
@@ -67,10 +72,10 @@ defmodule Ecto.Pools.ConnectionCache do
     {:ok, cache}
   end
 
-  def handle_call {:set_database, database_name}, from, cache do
+  def handle_call {:set_database, database_id}, from, cache do
     {pid, _ref} = from
-    :ets.insert(cache.database_id_ets, {pid, database_name})
-    {:reply, {:ok, database_name}, cache}
+    :ets.insert(cache.database_id_ets, {pid, database_id})
+    {:reply, {:ok, database_id}, cache}
   end
 
   def handle_call {:checkout, opts}, from, cache do
@@ -90,6 +95,8 @@ defmodule Ecto.Pools.ConnectionCache do
     # Find the cache item in our busy list.
     cache_item = Enum.find cache.busy, fn {_, c} -> c == conn end
 
+    # Remove it from busy list, add it to available list,
+    # then prune the available connections.
     cache = cache
       |> remove(:busy, cache_item)
       |> add(:available, cache_item)
@@ -98,6 +105,7 @@ defmodule Ecto.Pools.ConnectionCache do
     {:reply, :ok, cache}
   end
 
+  # Gets an existing connection or creates a new one.
   defp get_db_connection(cache, from_pid) do
     %{ available: available } = cache
     database_id = database_id(cache, from_pid)
@@ -116,6 +124,9 @@ defmodule Ecto.Pools.ConnectionCache do
 
     conn_options = database_connection_options(conn_options, database_id)
 
+    # So these are the "connections" we're pooling. Which is confusing to me
+    # because they themselves are connection pools (of size 1), which we have
+    # to checkout and checkin upstream. Why?
     db_conn = case DBConnection.Connection.start_link(conn_module, conn_options) do
       { :ok, conn } -> conn
       _ -> raise "Umm, what do I do??"
