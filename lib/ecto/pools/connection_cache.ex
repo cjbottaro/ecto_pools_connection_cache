@@ -40,7 +40,7 @@ defmodule Ecto.Pools.ConnectionCache do
   # I do not know what this is or how it's supposed to work.
   # I basically copied the poolboy pool implementation.
   def disconnect(pool_ref, err, state, opts) do
-    { name, conn, worker_ref } = pool_ref
+    { _name, _conn, worker_ref } = pool_ref
     DBConnection.Connection.disconnect(worker_ref, err, state, opts)
     checkin(pool_ref, state, opts)
   end
@@ -48,7 +48,7 @@ defmodule Ecto.Pools.ConnectionCache do
   # I do not know what this is or how it's supposed to work.
   # I basically copied the poolboy pool implementation.
   def stop(pool_ref, err, state, opts) do
-    { name, conn, worker_ref } = pool_ref
+    { _name, _conn, worker_ref } = pool_ref
     DBConnection.Connection.sync_stop(worker_ref, err, state, opts)
     checkin(pool_ref, state, opts)
   end

@@ -11,12 +11,12 @@ defmodule Ecto.Repo.ConnectionCache do
 
   def set_database(module, database) do
     pool_name = "#{module}.Pool" |> String.to_atom
-    database = cond do
-      is_list(database) -> normalize_database(database)
-      is_binary(database) -> normalize_database(database: database)
+    database = case database do
+      database when is_list(database) -> normalize_database(database)
+      database when is_binary(database) -> normalize_database(database: database)
       :default -> :default
       nil -> :default
-      true -> raise ArgumentError, "expected keyword list, string, nil or :default"
+      _ -> raise ArgumentError, "expected keyword list, string, nil or :default"
     end
     GenServer.call pool_name, {:set_database, database}
   end
