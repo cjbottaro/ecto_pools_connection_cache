@@ -1,8 +1,8 @@
-# EctoPoolsConnectionCache
+# Ecto.Pools.ConnectionCache
 
 An Ecto pool that is more of an LRU connection cache than a connection pool.
 It allows for connecting to multiple databases from a single repo and tries
-to maintain target size, although it makes no guarantees.
+to maintain target size, although it makes no guarantees about that.
 
 ## Why??
 
@@ -94,7 +94,7 @@ The connections are cached in LRU fashion.
 
 ## Default database
 
-If you use the repo without calling `set_database/1` first, then the _default
+If you use the repo without calling `set_database/1`, then the _default
 database_ is used, which is what is specified in `config.exs`.
 
 You can switch back to the default connection with:
