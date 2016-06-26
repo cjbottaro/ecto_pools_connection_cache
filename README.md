@@ -68,8 +68,10 @@ to use them without deploying code or restarting.
     end
     ```
 
-Note that it requires a special adapter to work (one that disables query
-caching). You can get one for Postgres here:
+## IMPORTANT
+
+It requires a special adapter to work with multiple databases
+(one that disables query caching). You can get one for Postgres here:
 
 https://github.com/cjbottaro/ecto_adapters_postgres_without_cache
 
@@ -84,8 +86,10 @@ The interesting part is when you want to connect to a different database:
 ```elixir
 YourRepo.set_database(host: "db02.company.com", database: "shard02")
 Repo.get(SomeModel, 1) # Will use a new connection to above database.
+
 YourRepo.set_database(host: "db03.company.com", database: "shard10")
 Repo.get(SomeModel, 1) # Will use a new connection to above database.
+
 YourRepo.set_database(host: "db02.company.com", database: "shard02")
 Repo.get(SomeModel, 1) # Should used a cached connection.
 ```
