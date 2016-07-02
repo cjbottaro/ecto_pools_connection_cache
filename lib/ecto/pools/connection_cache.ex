@@ -116,13 +116,30 @@ defmodule Ecto.Pools.ConnectionCache do
   # If our DBConnection.Connection died, then we need to detect that
   # and remove it from available and busy queues.
   def handle_info({:EXIT, db_conn, _reason}, cache) do
-    # TODO
+    # %{ available: available, busy: busy } = cache
+    # {_, cache} = pop_available(cache, db_conn)
+    # {_, cache} = pop_busy(cache, db_conn)
+    #
+    # %{ available: available, busy: busy } = cache
+    # cache =
+    #   if available == [] && busy == [] do
+    #     db_conn = new_db_conn(cache, :default)
+    #     push_available(cache, {:default, db_conn})
+    #   else
+    #     cache
+    #   end
+    #
+    {:noreply, cache}
   end
 
   # If our client (the process that called checkout) dies, then
   # we need to handle that.
   def handle_info({:DOWN, _ref, :process, pid, _reason}, cache) do
-    # TODO
+    IO.puts "!!!!!!!!!!!!! :DOWN #{inspect pid}"
+    # {conn, cache} = pop_busy(cache, pid)
+    # {_pid, database_id, db_conn} = conn
+    # cache = push_available(cache, {database_id, db_conn})
+    {:noreply, cache}
   end
 
   defp checkout_db_conn(cache, from_pid) do
@@ -245,7 +262,6 @@ defmodule Ecto.Pools.ConnectionCache do
 
   defp monitor_client(cache, pid) do
     ref = Process.monitor(pid)
-    IO.puts "%%%%%%%%%%%%%%%%%%% #{inspect ref} #{inspect pid}"
     %{ cache | monitors: Map.put(cache.monitors, pid, ref) }
   end
 
