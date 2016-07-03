@@ -4,15 +4,21 @@ defmodule Ecto.Pools.ConnectionCache do
     name:             nil,
     conn_options:     nil,
     conn_module:      nil,
-    busy:             [], # [ {owner_pid, database_id, db_conn} ]
-    available:        [], # [ {database_id, db_conn} ]
+    busy:             [],
+    available:        [],
     database_id_ets:  nil,
-    size:             nil,
-    monitors:         %{}
+    size:             nil
   ]
 
+  defmodule Connection do
+    defstruct [:database_id, :db_conn, :client_pid, :monitor_ref, :timer_ref]
+  end
+
   require Logger
+
   use GenServer
+
+  alias Connection, as: Conn
 
   @behaviour DBConnection.Pool
 
@@ -33,13 +39,12 @@ defmodule Ecto.Pools.ConnectionCache do
     Logger.debug "checkout #{inspect opts}"
     conn = GenServer.call(pool, {:checkout, opts})
 
-    { :ok, worker_ref, mod, state } = DBConnection.Connection.checkout(conn, opts)
+    { :ok, worker_ref, mod, state } = DBConnection.Connection.checkout(conn.db_conn, opts)
     pool_ref = { pool, conn, worker_ref }
     { :ok, pool_ref, mod, state }
   end
 
   def checkin(pool_ref, state, opts) do
-    IO.puts "!!!!!!!!!!! checkin #{inspect pool_ref}"
     { name, conn, worker_ref } = pool_ref
     DBConnection.Connection.checkin(worker_ref, state, opts)
     GenServer.call name, {:checkin, conn}
@@ -48,7 +53,6 @@ defmodule Ecto.Pools.ConnectionCache do
   # I do not know what this is or how it's supposed to work.
   # I basically copied the poolboy pool implementation.
   def disconnect(pool_ref, err, state, opts) do
-    IO.puts "!!!!!!!!!!!!!! disconnect"
     { name, conn, worker_ref } = pool_ref
     DBConnection.Connection.disconnect(worker_ref, err, state, opts)
     GenServer.call(name, {:checkin, conn})
@@ -58,7 +62,6 @@ defmodule Ecto.Pools.ConnectionCache do
   # I do not know what this is or how it's supposed to work.
   # I basically copied the poolboy pool implementation.
   def stop(pool_ref, err, state, opts) do
-    IO.puts "!!!!!!!!!!!!!! stop"
     { _name, _conn, worker_ref } = pool_ref
     try do
       DBConnection.Connection.sync_stop(worker_ref, err, state, opts)
@@ -84,8 +87,8 @@ defmodule Ecto.Pools.ConnectionCache do
     # Make an initial connection to default database
     # and put it in our available queue. This is
     # to satisy integration tests
-    db_conn = new_db_conn(cache, :default)
-    cache = push_available(cache, {:default, db_conn})
+    conn = new_connection(cache, :default)
+    cache = %{ cache | available: [conn] }
 
     {:ok, cache}
   end
@@ -95,25 +98,26 @@ defmodule Ecto.Pools.ConnectionCache do
     {:reply, {:ok, database_id}, cache}
   end
 
-  def handle_call {:checkout, opts}, {from, _}, cache do
-    Logger.debug "checkout by #{inspect from}"
+  def handle_call {:checkout, options}, {client_pid, _}, cache do
+    Logger.debug "checkout by #{inspect client_pid}"
 
-    case Keyword.get(opts, :timeout) do
-      nil -> nil
-      timeout -> Process.send_after(self(), {:checkout_timeout, from}, timeout)
-    end
+    database_id = get_database_id(cache, client_pid)
+    timeout = Keyword.get(options, :timeout)
 
-    {cache, db_conn} = cache
-      |> monitor_client(from)
-      |> checkout_db_conn(from)
-    {:reply, db_conn, cache}
+    conn = get_connection(cache, database_id)
+    {cache, conn} = available_to_busy(cache, conn, client_pid, timeout)
+
+    {:reply, conn, cache}
   end
 
-  def handle_call {:checkin, db_conn}, {from, _}, cache do
+  def handle_call {:checkin, conn}, {client_pid, _}, cache do
+    Logger.debug "checkin by #{inspect client_pid}"
+
     cache = cache
-      |> demonitor_client(from)
-      |> checkin_db_conn(db_conn)
+      |> busy_to_available(conn)
+      |> elem(0)
       |> prune
+
     {:reply, :ok, cache}
   end
 
@@ -138,52 +142,50 @@ defmodule Ecto.Pools.ConnectionCache do
 
   # If our client (the process that called checkout) dies, then
   # we need to handle that.
-  def handle_info({:DOWN, _ref, :process, pid, _reason}, cache) do
-    IO.puts "!!!!!!!!!!!!! :DOWN #{inspect pid}"
-    {conn, cache} = pop_busy(cache, pid)
-    {_pid, database_id, db_conn} = conn
-    cache = push_available(cache, {database_id, db_conn})
-    {:noreply, cache}
-  end
-
-  def handle_info({:checkout_timeout, client}, cache) do
-    cache = case pop_busy(cache, client) do
-      {nil, cache} -> cache
-      { {_, database_id, db_conn}, cache } ->
-        push_available(cache, {database_id, db_conn})
-    end
-    {:noreply, cache}
-  end
-
-  defp checkout_db_conn(cache, from_pid) do
-    database_id = get_database_id(cache, from_pid)
-    IO.puts "!!!!!!!!!! get_database_id: #{inspect database_id}"
-
-    {cache, db_conn} =
-      case pop_available(cache, database_id) do
-        {nil, cache} ->
-          Logger.debug("connection cache MISS #{inspect database_id}")
-          db_conn = new_db_conn(cache, database_id)
-          {cache, db_conn}
-        {conn, cache} ->
-          Logger.debug("connection cache HIT #{inspect database_id}")
-          {_, db_conn} = conn
-          {cache, db_conn}
-      end
-
-    cache = push_busy(cache, from_pid, {database_id, db_conn})
-
-    {cache, db_conn}
-  end
-
-  defp checkin_db_conn(cache, db_conn) do
-    IO.puts "checkin_db_conn: #{inspect cache} #{inspect db_conn}"
-    case pop_busy(cache, db_conn) do
-      {nil, cache} ->
+  def handle_info({:DOWN, _ref, :process, client_pid, _reason}, cache) do
+    cache = Enum.reduce cache.busy, cache, fn conn, cache ->
+      if conn.client_pid == client_pid do
+        busy_to_available(cache, conn) |> elem(0)
+      else
         cache
-      {{_pid, database_id, db_conn}, cache}  ->
-        push_available(cache, {database_id, db_conn})
+      end
     end
+    {:noreply, cache}
+  end
+
+  def handle_info({:timeout, conn}, cache) do
+    Logger.debug "Connection timeout: #{inspect conn}"
+    cache = Enum.reduce cache.busy, cache, fn c, cache ->
+      if c.client_pid == conn.client_pid && c.db_conn == c.db_conn do
+        Logger.debug "found one: #{inspect conn}"
+        busy_to_available(cache, conn) |> elem(0)
+      else
+        cache
+      end
+    end
+    Logger.debug(inspect cache)
+    {:noreply, cache}
+  end
+
+  defp get_connection(cache, database_id) do
+    case find_connection(cache, database_id) do
+      nil ->
+        Logger.debug("connection cache MISS #{inspect database_id}")
+        new_connection(cache, database_id)
+      conn ->
+        Logger.debug("connection cache HIT #{inspect database_id}")
+        conn
+    end
+  end
+
+  defp find_connection(cache, database_id) do
+    Enum.find(cache.available, &(&1.database_id == database_id))
+  end
+
+  defp new_connection(cache, database_id) do
+    conn_options = database_connection_options(cache.conn_options, database_id)
+    {:ok, db_conn} = DBConnection.Connection.start_link(cache.conn_module, conn_options)
+    %Conn{ database_id: database_id, db_conn: db_conn }
   end
 
   defp get_database_id(cache, from_pid) do
@@ -199,12 +201,6 @@ defmodule Ecto.Pools.ConnectionCache do
     end
   end
 
-  defp new_db_conn(cache, database_id) do
-    conn_options = database_connection_options(cache.conn_options, database_id)
-    {:ok, db_conn} = DBConnection.Connection.start_link(cache.conn_module, conn_options)
-    db_conn
-  end
-
   defp database_connection_options(default_options, database_id) do
     case database_id do
       :default -> default_options
@@ -212,55 +208,15 @@ defmodule Ecto.Pools.ConnectionCache do
     end
   end
 
-  def push_available(%{ available: available } = cache, conn) do
-    %{ cache | available: [conn | available] }
-  end
-
-  defp pop_available(%{ available: available } = cache, database_id) when is_atom(database_id) do
-    conn = List.keyfind(available, database_id, 0)
-    pop_available(cache, conn)
-  end
-
-  defp pop_available(%{ available: available } = cache, db_conn) when is_pid(db_conn) do
-    conn = List.keyfind(available, db_conn, 1)
-    pop_available(cache, conn)
-  end
-
-  defp pop_available(cache, nil), do: {nil, cache}
-  defp pop_available(%{ available: available } = cache, conn) when is_tuple(conn) do
-    if Enum.member?(available, conn) do
-      {conn, %{ cache | available: List.delete(available, conn) }}
-    else
-      {nil, cache}
-    end
-  end
-
-  def push_busy(%{ busy: busy } = cache, pid, {database_id, db_conn}) do
-    %{ cache | busy: [ {pid, database_id, db_conn} | busy ] }
-  end
-
-  def pop_busy(%{ busy: busy } = cache, client_or_db_conn) do
-    case List.keyfind(busy, client_or_db_conn, 2) do
-      nil ->
-        conn = List.keyfind(busy, client_or_db_conn, 0)
-        busy = List.keydelete(busy, client_or_db_conn, 0)
-        {conn, %{ cache | busy: busy }}
-      conn ->
-        busy = List.keydelete(busy, client_or_db_conn, 2)
-        {conn, %{ cache | busy: busy }}
-    end
-  end
-
   defp prune(%{ available: available, size: size } = cache) when length(available) <= size, do: cache
   defp prune(%{ available: available, size: size } = cache) do
 
-    pruning_fn = fn {cache_item, i}, memo ->
+    pruning_fn = fn {conn, i}, memo ->
       if i < size do
-        [cache_item | memo]
+        [conn | memo]
       else
-        {database, db_conn} = cache_item
-        Logger.debug("expiring connection to #{inspect database}")
-        close_connection(db_conn)
+        Logger.debug("expiring connection to #{inspect conn.database_id}")
+        close_connection(conn.db_conn)
         memo
       end
     end
@@ -279,15 +235,69 @@ defmodule Ecto.Pools.ConnectionCache do
     Process.exit(db_conn, :shutdown)
   end
 
-  defp monitor_client(cache, pid) do
-    ref = Process.monitor(pid)
-    %{ cache | monitors: Map.put(cache.monitors, pid, ref) }
+  def available_to_busy(cache, conn, client_pid, timeout) do
+    # Track the client.
+    conn = %{ conn | client_pid: client_pid }
+
+    # Monitor the client.
+    conn = %{ conn | monitor_ref: Process.monitor(client_pid) }
+
+    # Set the timeout if needed.
+    conn = set_timer(conn, timeout)
+
+    # Remove from available list.
+    available = List.delete(cache.available, make_available(conn))
+
+    # Add to busy list.
+    busy = [conn | cache.busy]
+
+    # Update the cache
+    cache = %{ cache | available: available, busy: busy }
+
+    {cache, hd(busy)}
   end
 
-  defp demonitor_client(cache, pid) do
-    {ref, monitors} = Map.pop(cache.monitors, pid)
-    Process.demonitor(ref)
-    %{ cache | monitors: monitors }
+  def busy_to_available(cache, conn) do
+    case pop_busy(cache, conn) do
+      {nil, cache} -> {cache, nil}
+
+      {conn, cache} ->
+        # Demonitor the client.
+        Process.demonitor(conn.monitor_ref)
+
+        # Cancel the timer.
+        cancel_timer(conn.timer_ref)
+
+        # Add to available.
+        available = [make_available(conn) | cache.available]
+
+        # Update the cache.
+        cache = %{ cache | available: available }
+
+        {cache, hd(available)}
+    end
   end
+
+  defp pop_busy(cache, conn) do
+    case Enum.find(cache.busy, &(&1.db_conn == conn.db_conn)) do
+      nil -> {nil, cache}
+      conn -> {conn, %{ cache | busy: List.delete(cache.busy, conn) }}
+    end
+  end
+
+  defp make_available(conn) do
+    %{ conn | client_pid: nil, monitor_ref: nil, timer_ref: nil }
+  end
+
+  defp set_timer(conn, nil), do: conn
+  defp set_timer(conn, timeout) do
+    # The conn being sent won't have the timer_ref, but that's ok,
+    # we don't need it in the timeout handler.
+    timer_ref = Process.send_after(self, {:timeout, conn}, timeout)
+    %{ conn | timer_ref: timer_ref }
+  end
+
+  defp cancel_timer(nil), do: nil
+  defp cancel_timer(timer_ref), do: Process.cancel_timer(timer_ref)
 
 end
