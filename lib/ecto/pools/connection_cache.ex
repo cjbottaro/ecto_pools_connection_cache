@@ -157,13 +157,11 @@ defmodule Ecto.Pools.ConnectionCache do
     Logger.debug "Connection timeout: #{inspect conn}"
     cache = Enum.reduce cache.busy, cache, fn c, cache ->
       if c.client_pid == conn.client_pid && c.db_conn == c.db_conn do
-        Logger.debug "found one: #{inspect conn}"
         busy_to_available(cache, conn) |> elem(0)
       else
         cache
       end
     end
-    Logger.debug(inspect cache)
     {:noreply, cache}
   end
 
