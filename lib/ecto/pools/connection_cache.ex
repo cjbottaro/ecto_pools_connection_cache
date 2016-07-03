@@ -30,13 +30,11 @@ defmodule Ecto.Pools.ConnectionCache do
   end
 
   def checkout(pool, opts) do
-    IO.puts "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
+    Logger.debug "checkout #{inspect opts}"
     conn = GenServer.call(pool, {:checkout, opts})
-    IO.puts "conn #{inspect conn}, opts #{inspect opts}"
 
     { :ok, worker_ref, mod, state } = DBConnection.Connection.checkout(conn, opts)
     pool_ref = { pool, conn, worker_ref }
-    IO.puts "done checkout #{inspect pool_ref}"
     { :ok, pool_ref, mod, state }
   end
 
@@ -61,11 +59,10 @@ defmodule Ecto.Pools.ConnectionCache do
   # I basically copied the poolboy pool implementation.
   def stop(pool_ref, err, state, opts) do
     IO.puts "!!!!!!!!!!!!!! stop"
-    { name, _conn, worker_ref } = pool_ref
+    { _name, _conn, worker_ref } = pool_ref
     try do
       DBConnection.Connection.sync_stop(worker_ref, err, state, opts)
     after
-      {pool_pid, _, _} = pool_ref
       checkin(pool_ref, state, opts)
     end
   end
@@ -99,6 +96,13 @@ defmodule Ecto.Pools.ConnectionCache do
   end
 
   def handle_call {:checkout, opts}, {from, _}, cache do
+    Logger.debug "checkout by #{inspect from}"
+
+    case Keyword.get(opts, :timeout) do
+      nil -> nil
+      timeout -> Process.send_after(self(), {:checkout_timeout, from}, timeout)
+    end
+
     {cache, db_conn} = cache
       |> monitor_client(from)
       |> checkout_db_conn(from)
@@ -136,9 +140,18 @@ defmodule Ecto.Pools.ConnectionCache do
   # we need to handle that.
   def handle_info({:DOWN, _ref, :process, pid, _reason}, cache) do
     IO.puts "!!!!!!!!!!!!! :DOWN #{inspect pid}"
-    # {conn, cache} = pop_busy(cache, pid)
-    # {_pid, database_id, db_conn} = conn
-    # cache = push_available(cache, {database_id, db_conn})
+    {conn, cache} = pop_busy(cache, pid)
+    {_pid, database_id, db_conn} = conn
+    cache = push_available(cache, {database_id, db_conn})
+    {:noreply, cache}
+  end
+
+  def handle_info({:checkout_timeout, client}, cache) do
+    cache = case pop_busy(cache, client) do
+      {nil, cache} -> cache
+      { {_, database_id, db_conn}, cache } ->
+        push_available(cache, {database_id, db_conn})
+    end
     {:noreply, cache}
   end
 
@@ -226,10 +239,16 @@ defmodule Ecto.Pools.ConnectionCache do
     %{ cache | busy: [ {pid, database_id, db_conn} | busy ] }
   end
 
-  def pop_busy(%{ busy: busy } = cache, db_conn) do
-    conn = List.keyfind(busy, db_conn, 2)
-    busy = List.keydelete(busy, db_conn, 2)
-    {conn, %{ cache | busy: busy }}
+  def pop_busy(%{ busy: busy } = cache, client_or_db_conn) do
+    case List.keyfind(busy, client_or_db_conn, 2) do
+      nil ->
+        conn = List.keyfind(busy, client_or_db_conn, 0)
+        busy = List.keydelete(busy, client_or_db_conn, 0)
+        {conn, %{ cache | busy: busy }}
+      conn ->
+        busy = List.keydelete(busy, client_or_db_conn, 2)
+        {conn, %{ cache | busy: busy }}
+    end
   end
 
   defp prune(%{ available: available, size: size } = cache) when length(available) <= size, do: cache
